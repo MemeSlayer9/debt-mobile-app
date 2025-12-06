@@ -39,6 +39,11 @@ type FilterType = {
   value: string;
 };
 
+type SortType = {
+  label: string;
+  value: string;
+};
+
 type RootStackParamList = {
   BalanceHistoryScreen: { customer: Customer };
 };
@@ -58,8 +63,10 @@ export default function BalanceHistoryScreen() {
   const [filteredTransactions, setFilteredTransactions] = useState<Transaction[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<string>("all");
+  const [selectedSort, setSelectedSort] = useState<string>("newest");
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
+  const [showSortDropdown, setShowSortDropdown] = useState(false);
   const [customDateRange, setCustomDateRange] = useState<{
     startDate?: Date;
     endDate?: Date;
@@ -73,6 +80,12 @@ export default function BalanceHistoryScreen() {
     { label: "Custom Date", value: "custom" },
     { label: "All Transactions", value: "all" },
   ];
+
+  const sortOptions: SortType[] = [
+    { label: "Newest", value: "newest" },
+    { label: "Oldest", value: "oldest" },
+ 
+   ];
 
   const formatCurrency = (amount: number) => {
     return amount.toLocaleString('en-US', {
@@ -121,26 +134,57 @@ export default function BalanceHistoryScreen() {
     }
   };
 
-  const filterTransactions = useCallback((filterValue: string) => {
-    if (filterValue === "all") {
-      setFilteredTransactions(transactions);
-      return;
+  const sortTransactions = useCallback((transactionsToSort: Transaction[], sortValue: string) => {
+    const sorted = [...transactionsToSort];
+    
+    switch (sortValue) {
+      case "newest":
+        return sorted.sort((a, b) => {
+          const dateA = new Date(a.created_at || '').getTime();
+          const dateB = new Date(b.created_at || '').getTime();
+          return dateB - dateA; // Newest first
+        });
+      case "oldest":
+        return sorted.sort((a, b) => {
+          const dateA = new Date(a.created_at || '').getTime();
+          const dateB = new Date(b.created_at || '').getTime();
+          return dateA - dateB; // Oldest first
+        });
+      case "amount_high":
+        return sorted.sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+      case "amount_low":
+        return sorted.sort((a, b) => Math.abs(a.amount) - Math.abs(b.amount));
+      case "type":
+        const typeOrder = { 'balance_add': 1, 'balance_edit': 2, 'balance_delete': 3, 'transaction': 4 };
+        return sorted.sort((a, b) => {
+          const typeA = typeOrder[a.type as keyof typeof typeOrder] || 5;
+          const typeB = typeOrder[b.type as keyof typeof typeOrder] || 5;
+          return typeA - typeB;
+        });
+      default:
+        return sorted;
+    }
+  }, []);
+
+  const filterAndSortTransactions = useCallback((filterValue: string, sortValue: string) => {
+    let filtered = transactions;
+
+    // Apply date filter
+    if (filterValue !== "all") {
+      const dateRange = getDateRange(filterValue);
+      if (dateRange) {
+        filtered = transactions.filter(transaction => {
+          if (!transaction.created_at) return false;
+          const transactionDate = new Date(transaction.created_at);
+          return transactionDate >= dateRange.start && transactionDate <= dateRange.end;
+        });
+      }
     }
 
-    const dateRange = getDateRange(filterValue);
-    if (!dateRange) {
-      setFilteredTransactions(transactions);
-      return;
-    }
-
-    const filtered = transactions.filter(transaction => {
-      if (!transaction.created_at) return false;
-      const transactionDate = new Date(transaction.created_at);
-      return transactionDate >= dateRange.start && transactionDate <= dateRange.end;
-    });
-
-    setFilteredTransactions(filtered);
-  }, [transactions, customDateRange]);
+    // Apply sorting
+    const sortedAndFiltered = sortTransactions(filtered, sortValue);
+    setFilteredTransactions(sortedAndFiltered);
+  }, [transactions, customDateRange, sortTransactions]);
 
   const fetchBalanceTransactions = async () => {
     const { data, error } = await supabase
@@ -169,15 +213,21 @@ export default function BalanceHistoryScreen() {
     if (filterValue === "custom") {
       setShowDatePicker(true);
     } else {
-      filterTransactions(filterValue);
+      filterAndSortTransactions(filterValue, selectedSort);
     }
+  };
+
+  const handleSortPress = (sortValue: string) => {
+    setSelectedSort(sortValue);
+    setShowSortDropdown(false);
+    filterAndSortTransactions(selectedFilter, sortValue);
   };
 
   const onDatePickerConfirm = ({ startDate, endDate }: { startDate?: Date; endDate?: Date }) => {
     setCustomDateRange({ startDate, endDate });
     setShowDatePicker(false);
     if (startDate && endDate) {
-      filterTransactions("custom");
+      filterAndSortTransactions("custom", selectedSort);
     }
   };
 
@@ -187,10 +237,10 @@ export default function BalanceHistoryScreen() {
     }, [customer.id])
   );
 
-  // Apply filter when transactions change
+  // Apply filter and sort when transactions change
   React.useEffect(() => {
-    filterTransactions(selectedFilter);
-  }, [transactions, filterTransactions, selectedFilter]);
+    filterAndSortTransactions(selectedFilter, selectedSort);
+  }, [transactions, filterAndSortTransactions, selectedFilter, selectedSort]);
 
   const getTransactionIcon = (type: string) => {
     switch (type) {
@@ -254,6 +304,11 @@ export default function BalanceHistoryScreen() {
     return selectedFilterObj ? selectedFilterObj.label : "All Transactions";
   };
 
+  const getSelectedSortLabel = () => {
+    const selectedSortObj = sortOptions.find(sort => sort.value === selectedSort);
+    return selectedSortObj ? selectedSortObj.label : "Newest First";
+  };
+
   return (
     <ScrollView 
       style={styles.container}
@@ -282,50 +337,101 @@ export default function BalanceHistoryScreen() {
         )}
       </View>
 
-      {/* Filter Section */}
-      <View style={styles.filterContainer}>
-        <Text style={styles.filterTitle}>Filter by Date</Text>
-        
-        {/* Dropdown Button */}
-        <TouchableOpacity 
-          style={styles.dropdownButton} 
-          onPress={() => setShowFilterDropdown(!showFilterDropdown)}
-        >
-          <Text style={styles.dropdownButtonText}>
-            {getSelectedFilterLabel()}
-          </Text>
-          <Text style={[styles.dropdownArrow, { transform: [{ rotate: showFilterDropdown ? '180deg' : '0deg' }] }]}>
-            ▼
-          </Text>
-        </TouchableOpacity>
+      {/* Filter and Sort Section */}
+      <View style={styles.filterSortContainer}>
+        {/* Filter Section */}
+        <View style={styles.filterContainer}>
+          <Text style={styles.filterTitle}>Filter by Date</Text>
+          
+          <TouchableOpacity 
+            style={styles.dropdownButton} 
+            onPress={() => {
+              setShowFilterDropdown(!showFilterDropdown);
+              setShowSortDropdown(false);
+            }}
+          >
+            <Text style={styles.dropdownButtonText}>
+              {getSelectedFilterLabel()}
+            </Text>
+            <Text style={[styles.dropdownArrow, { transform: [{ rotate: showFilterDropdown ? '180deg' : '0deg' }] }]}>
+              ▼
+            </Text>
+          </TouchableOpacity>
 
-        {/* Dropdown Options */}
-        {showFilterDropdown && (
-          <View style={styles.dropdownOptions}>
-            {filters.map((filter) => (
-              <TouchableOpacity
-                key={filter.value}
-                style={[
-                  styles.dropdownOption,
-                  selectedFilter === filter.value && styles.activeDropdownOption
-                ]}
-                onPress={() => handleFilterPress(filter.value)}
-              >
-                <Text
+          {showFilterDropdown && (
+            <View style={styles.dropdownOptions}>
+              {filters.map((filter) => (
+                <TouchableOpacity
+                  key={filter.value}
                   style={[
-                    styles.dropdownOptionText,
-                    selectedFilter === filter.value && styles.activeDropdownOptionText
+                    styles.dropdownOption,
+                    selectedFilter === filter.value && styles.activeDropdownOption
                   ]}
+                  onPress={() => handleFilterPress(filter.value)}
                 >
-                  {filter.value === "custom" ? getCustomDateText() : filter.label}
-                </Text>
-                {selectedFilter === filter.value && (
-                  <Text style={styles.checkmark}>✓</Text>
-                )}
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
+                  <Text
+                    style={[
+                      styles.dropdownOptionText,
+                      selectedFilter === filter.value && styles.activeDropdownOptionText
+                    ]}
+                  >
+                    {filter.value === "custom" ? getCustomDateText() : filter.label}
+                  </Text>
+                  {selectedFilter === filter.value && (
+                    <Text style={styles.checkmark}>✓</Text>
+                  )}
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+        </View>
+
+        {/* Sort Section */}
+        <View style={styles.sortContainer}>
+          <Text style={styles.sortTitle}>Sort by</Text>
+          
+          <TouchableOpacity 
+            style={styles.dropdownButton} 
+            onPress={() => {
+              setShowSortDropdown(!showSortDropdown);
+              setShowFilterDropdown(false);
+            }}
+          >
+            <Text style={styles.dropdownButtonText}>
+              {getSelectedSortLabel()}
+            </Text>
+            <Text style={[styles.dropdownArrow, { transform: [{ rotate: showSortDropdown ? '180deg' : '0deg' }] }]}>
+              ▼
+            </Text>
+          </TouchableOpacity>
+
+          {showSortDropdown && (
+            <View style={styles.dropdownOptions}>
+              {sortOptions.map((sort) => (
+                <TouchableOpacity
+                  key={sort.value}
+                  style={[
+                    styles.dropdownOption,
+                    selectedSort === sort.value && styles.activeDropdownOption
+                  ]}
+                  onPress={() => handleSortPress(sort.value)}
+                >
+                  <Text
+                    style={[
+                      styles.dropdownOptionText,
+                      selectedSort === sort.value && styles.activeDropdownOptionText
+                    ]}
+                  >
+                    {sort.label}
+                  </Text>
+                  {selectedSort === sort.value && (
+                    <Text style={styles.checkmark}>✓</Text>
+                  )}
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+        </View>
       </View>
 
       {/* Balance History List */}
@@ -461,10 +567,23 @@ const styles = StyleSheet.create({
     fontSize: 28, 
     fontWeight: "bold" 
   },
-  filterContainer: {
+  filterSortContainer: {
     marginBottom: 20,
+    gap: 16,
+  },
+  filterContainer: {
+    flex: 1,
+  },
+  sortContainer: {
+    flex: 1,
   },
   filterTitle: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 12,
+  },
+  sortTitle: {
     color: "#FFFFFF",
     fontSize: 16,
     fontWeight: "600",
@@ -497,6 +616,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#333333",
     maxHeight: 250,
+    position: 'relative',
+    zIndex: 1000,
   },
   dropdownOption: {
     padding: 16,

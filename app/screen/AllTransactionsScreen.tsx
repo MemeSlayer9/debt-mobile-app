@@ -33,7 +33,6 @@ type Customer = {
   due: number;
   date: string;
 };
-
 type Transaction = {
   transaction_id?: string;
   customer_id?: number;
@@ -41,11 +40,20 @@ type Transaction = {
   created_at?: string;
   old_balance?: number | null;
   balance_after?: number | null;
+  backup_id?: string;
+  type?: string; // ADD THIS LINE
+  description?: string; // ADD THIS TOO (for balance_add descriptions)
 };
+
 
 type FilterType = {
   label: string;
   value: "today" | "week" | "month" | "year" | "custom" | "all";
+};
+
+type SortType = {
+  label: string;
+  value: "newest" | "oldest";
 };
 
 type DateRange = {
@@ -53,8 +61,8 @@ type DateRange = {
   end: CalendarDate;
 };
 
-// Tab types
-type TabType = "all" | "new" | "old";
+// Tab types - ONLY NEW AND OLD
+type TabType = "new" | "old";
 
 // Navigation type definition
 type RootStackParamList = {
@@ -70,10 +78,9 @@ export default function AllTransactionsScreen() {
 
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [filteredTransactions, setFilteredTransactions] = useState<{
-    all: Transaction[];
     new: Transaction[];
     old: Transaction[];
-  }>({ all: [], new: [], old: [] });
+  }>({ new: [], old: [] });
   
   const [selectedFilter, setSelectedFilter] = useState<FilterType>({
     label: "All Transactions",
@@ -89,8 +96,22 @@ export default function AllTransactionsScreen() {
   const [currentBalance, setCurrentBalance] = useState<number>(customer.balance ?? 0);
   const [isRestored, setIsRestored] = useState<boolean>(false);
   
-  // New state for tab navigation
-  const [activeTab, setActiveTab] = useState<TabType>("all");
+  // New state for tab navigation - DEFAULT TO "NEW"
+  const [activeTab, setActiveTab] = useState<TabType>("new");
+  
+  // State for segment selection (replaces previous balance selection)
+  const [oldSegmentsList, setOldSegmentsList] = useState<{
+    id: string;
+    previousBalance: number;
+    transactions: Transaction[];
+    timestamp: string;
+  }[]>([]);
+  const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
+  const [segmentDropdownData, setSegmentDropdownData] = useState<{label: string, value: string}[]>([]);
+
+  // Sort functionality state
+  const [selectedSort, setSelectedSort] = useState<"newest" | "oldest">("newest");
+  const [showSortDropdown, setShowSortDropdown] = useState(false);
 
   // *** Connectivity flag ***
   const [isConnected, setIsConnected] = useState<boolean>(true);
@@ -114,6 +135,21 @@ export default function AllTransactionsScreen() {
     { label: "Custom Date", value: "custom" },
     { label: "All Transactions", value: "all" },
   ];
+
+  const sortOptions: SortType[] = [
+    { label: "Newest Date", value: "newest" },
+    { label: "Oldest Date", value: "oldest" },
+  ];
+
+  const getSelectedSortLabel = () => {
+    const selectedSortObj = sortOptions.find(sort => sort.value === selectedSort);
+    return selectedSortObj ? selectedSortObj.label : "Newest First";
+  };
+
+  const handleSortPress = (sortValue: "newest" | "oldest") => {
+    setSelectedSort(sortValue);
+    setShowSortDropdown(false);
+  };
 
   // --- Helpers ---
 
@@ -166,29 +202,121 @@ export default function AllTransactionsScreen() {
     }
   };
 
+  // Sort transactions helper
+  const sortTransactions = (txs: Transaction[]): Transaction[] => {
+    return [...txs].sort((a, b) => {
+      const dateA = new Date(a.created_at!).getTime();
+      const dateB = new Date(b.created_at!).getTime();
+      return selectedSort === "newest" ? dateB - dateA : dateA - dateB;
+    });
+  };
+
+  const getRestoredBackupIds = async (): Promise<string[]> => {
+    const str = await AsyncStorage.getItem(`@restoredBackups_${customer.id}`);
+    return str ? JSON.parse(str) : [];
+  };
+
+  // Mark a backup ID as restored
+  const markBackupAsRestored = async (backupId: string) => {
+    const restored = await getRestoredBackupIds();
+    if (!restored.includes(backupId)) {
+      restored.push(backupId);
+      await AsyncStorage.setItem(
+        `@restoredBackups_${customer.id}`,
+        JSON.stringify(restored)
+      );
+    }
+  };
+
+  // Helper function to perform the actual backup and delete
+  const performBackupAndDelete = async (
+    backupId: string,
+    transactionsToBackup: Transaction[],
+    transactionIdsToDelete: string[],
+    tabName: string
+  ) => {
+    const backupData = {
+      id: backupId,
+      timestamp: new Date().toISOString(),
+      transactions: transactionsToBackup,
+      totalAmount: transactionsToBackup.reduce((sum, tx) => sum + tx.amount, 0),
+      restored: false
+    };
+    
+    await AsyncStorage.setItem(
+      `@oldTxBackup_${customer.id}_${backupId}`,
+      JSON.stringify(backupData)
+    );
+    
+    await AsyncStorage.setItem(
+      `@latestBackupId_${customer.id}`,
+      backupId
+    );
+    
+    await supabase
+      .from("transactions")
+      .delete()
+      .in("transaction_id", transactionIdsToDelete);
+      
+    setTransactions(prev => 
+      prev.filter(tx => !transactionIdsToDelete.includes(tx.transaction_id || ""))
+    );
+    
+    setSelectedTransactions([]);
+    
+    Alert.alert(
+      "Success",
+      `${tabName} transactions deleted and backed up. Balance unchanged. Use "Restore Old Transactions" to recover them.`
+    );
+  };
+
   // Fetch Supabase transactions & balance
-  const fetchTransactions = async () => {
+const fetchTransactions = async () => {
+  try {
     const { data, error } = await supabase
       .from("transactions")
       .select("*")
       .eq("customer_id", customer.id)
       .order("created_at", { ascending: false });
-    if (!error) setTransactions(data ?? []);
-  };
-  
-  const fetchCustomerBalance = async () => {
+    
+    if (error) {
+      console.error("Error fetching transactions:", error);
+    } else {
+      console.log("=== FETCHED DATA ===");
+      console.log("Fetched transactions count:", data?.length || 0);
+      if (data && data.length > 0) {
+        console.log("First transaction:", JSON.stringify(data[0], null, 2));
+        console.log("old_balance:", data[0].old_balance);
+        console.log("balance_after:", data[0].balance_after);
+      }
+      setTransactions(data ?? []);
+    }
+  } catch (error) {
+    console.error("Exception fetching transactions:", error);
+  }
+};
+
+const fetchCustomerBalance = async () => {
+  try {
     const { data, error } = await supabase
       .from("customers")
       .select("balance")
       .eq("id", customer.id)
       .maybeSingle();
-    if (!error && data) setCurrentBalance(data.balance ?? 0);
-  };
+    
+    if (error) {
+      console.error("Error fetching balance:", error);
+    } else if (data) {
+      console.log("Fetched balance from DB:", data.balance);
+      setCurrentBalance(data.balance ?? 0);
+    }
+  } catch (error) {
+    console.error("Exception fetching balance:", error);
+  }
+};
 
   // Initial load & on focus
-  useEffect(() => {
-    fetchTransactions();
-  }, [customer.id]);
+ 
   
   useFocusEffect(
     useCallback(() => {
@@ -198,70 +326,222 @@ export default function AllTransactionsScreen() {
   );
 
   // Segment old vs. new for backups, deletes, etc.
-  const getTransactionSegments = (txs: Transaction[]) => {
-    const asc = [...txs].sort(
-      (a, b) =>
-        new Date(a.created_at!).getTime() -
-        new Date(b.created_at!).getTime()
-    );
-    const segments: Transaction[][] = [];
-    let curr: Transaction[] = [];
-    asc.forEach((tx) => {
-      curr.push(tx);
-      if ((tx.balance_after ?? 0) === 0) {
-        segments.push(curr);
-        curr = [];
-      }
+const getTransactionSegments = (txs: Transaction[]) => {
+  console.log("=== SEGMENTATION DEBUG ===");
+  console.log("Input transactions:", txs.length);
+  
+  // FILTER OUT balance_add transactions HERE TOO!
+  const realTransactions = txs.filter(tx => tx.type !== 'balance_add');
+  console.log("After filtering balance_add:", realTransactions.length);
+  
+  if (realTransactions.length === 0) {
+    return { 
+      oldTransactions: [], 
+      newTransactions: [], 
+      oldSegments: [] 
+    };
+  }
+  
+  // Sort by created_at ascending (oldest first)
+  const asc = [...realTransactions].sort(
+    (a, b) => new Date(a.created_at!).getTime() - new Date(b.created_at!).getTime()
+  );
+  
+  console.log("Sorted transactions:", asc.length);
+  
+  const segments: Transaction[][] = [];
+  let curr: Transaction[] = [];
+  
+  asc.forEach((tx, index) => {
+    console.log(`TX ${index}:`, {
+      id: tx.transaction_id,
+      old_balance: tx.old_balance,
+      amount: tx.amount,
+      balance_after: tx.balance_after,
+      created_at: tx.created_at
     });
-    if (curr.length) segments.push(curr);
-
-    let oldTx: Transaction[] = [];
-    let newTx: Transaction[] = [];
-    if (segments.length) {
-      const last = segments[segments.length - 1];
-      if ((last[last.length - 1].balance_after ?? 0) === 0)
-        oldTx = segments.flat();
-      else {
-        oldTx = segments.slice(0, -1).flat();
-        newTx = last;
-      }
+    
+    curr.push(tx);
+    
+    // Check if this transaction resulted in balance = 0 (PAID)
+    if (tx.balance_after === 0 || tx.balance_after === null) {
+      console.log(`  -> Segment END detected at TX ${index} (balance_after = ${tx.balance_after})`);
+      segments.push([...curr]);
+      curr = [];
     }
-    return { oldTransactions: oldTx, newTransactions: newTx };
+  });
+  
+  // If there are remaining transactions (current unpaid balance)
+  if (curr.length > 0) {
+    console.log("Adding remaining transactions as NEW segment:", curr.length);
+    segments.push(curr);
+  }
+  
+  console.log("Total segments created:", segments.length);
+
+  let oldTx: Transaction[] = [];
+  let newTx: Transaction[] = [];
+  let oldSegments: Transaction[][] = [];
+  
+  if (segments.length === 0) {
+    return { oldTransactions: [], newTransactions: [], oldSegments: [] };
+  }
+  
+  // Check the last segment
+  const lastSegment = segments[segments.length - 1];
+  const lastTxInLastSegment = lastSegment[lastSegment.length - 1];
+  
+  console.log("Last segment last transaction balance_after:", lastTxInLastSegment.balance_after);
+  
+  // If last segment ends with balance = 0, ALL segments are old (fully paid)
+  if (lastTxInLastSegment.balance_after === 0 || lastTxInLastSegment.balance_after === null) {
+    oldSegments = segments;
+    oldTx = segments.flat();
+    console.log("All segments are OLD (all paid off)");
+  } else {
+    // Last segment has balance > 0, so it's NEW
+    // All previous segments are OLD
+    oldSegments = segments.slice(0, -1);
+    oldTx = oldSegments.flat();
+    newTx = lastSegment;
+    console.log(`Last segment is NEW (${newTx.length} txs), previous ${oldSegments.length} segments are OLD (${oldTx.length} txs)`);
+  }
+  
+  return { oldTransactions: oldTx, newTransactions: newTx, oldSegments };
+};
+
+   const getAllOldSegments = () => {
+    const { oldSegments } = getTransactionSegments(transactions);
+    console.log("Getting all old segments:", oldSegments.length);
+    
+    return oldSegments.map((segment, index) => {
+      if (segment.length === 0) return null;
+      
+      const firstTx = segment[0];
+      const lastTx = segment[segment.length - 1];
+      
+      // Calculate the ORIGINAL starting balance by adding up ALL transaction amounts
+      // This gives us the balance BEFORE any deductions were made (the 500 you want)
+      const totalTransactionAmount = segment.reduce((sum, tx) => sum + tx.amount, 0);
+      const originalStartingBalance = totalTransactionAmount;
+      
+      // Create unique ID for this segment using first transaction ID or timestamp
+      const segmentId = firstTx?.transaction_id || `segment_${index}_${firstTx?.created_at}`;
+      
+      console.log(`Segment ${index}:`, {
+        id: segmentId,
+        originalStartingBalance,
+        totalTransactionAmount,
+        transactions: segment.length,
+        date: firstTx?.created_at,
+        firstTxOldBalance: firstTx?.old_balance
+      });
+      
+      return {
+        id: segmentId,
+        previousBalance: originalStartingBalance, // This is the sum of all transactions (always 500)
+        transactions: segment,
+        timestamp: lastTx?.created_at || firstTx?.created_at || new Date().toISOString()
+      };
+    }).filter(seg => seg !== null) as {
+      id: string;
+      previousBalance: number;
+      transactions: Transaction[];
+      timestamp: string;
+    }[];
+  };
+
+  // Get transactions for a specific segment by ID
+  const getTransactionsForSegment = (segmentId: string) => {
+    const allSegments = getAllOldSegments();
+    console.log("Looking for segment with ID:", segmentId);
+    console.log("Available segments:", allSegments.length);
+    
+    const segment = allSegments.find(seg => seg.id === segmentId);
+    
+    if (!segment) {
+      console.log("Segment not found!");
+      return [];
+    }
+    
+    console.log("Found segment with", segment.transactions.length, "transactions");
+    return segment.transactions;
+  };
+
+  const calculateBalanceAfter = (tx: Transaction, index: number, allTxs: Transaction[]) => {
+    // If balance_after exists and is valid, use it
+    if (tx.balance_after !== null && tx.balance_after !== undefined) {
+      return tx.balance_after;
+    }
+    
+    // Otherwise calculate it
+    return (tx.old_balance ?? 0) - tx.amount;
   };
 
   // Filter application
-  const filterTransactions = () => {
-    let filtered = [...transactions];
-    if (selectedFilter.value !== "all") {
-      const range =
-        selectedFilter.value === "custom"
-          ? dateRange
-          : getDateRange(selectedFilter.value);
-      filtered = filtered.filter((tx) => {
-        if (!tx.created_at) return false;
-        const d = new Date(tx.created_at);
-        return (
-          (!range.start || d >= range.start) &&
-          (!range.end || d <= range.end)
-        );
-      });
-    }
-    
-    // Split transactions into new and old categories
-    const { newTransactions, oldTransactions } = getTransactionSegments(filtered);
-    
-    setFilteredTransactions({
-      all: filtered,
-      new: newTransactions,
-      old: oldTransactions
+const filterTransactions = () => {
+  // FILTER OUT balance_add transactions - we don't want to see them!
+  let filtered = transactions.filter(tx => tx.type !== 'balance_add');
+  
+  // Ensure all transactions have balance_after calculated
+  filtered = filtered.map((tx, index, arr) => ({
+    ...tx,
+    balance_after: tx.balance_after ?? ((tx.old_balance ?? 0) - tx.amount)
+  }));
+  
+  if (selectedFilter.value !== "all") {
+    const range =
+      selectedFilter.value === "custom"
+        ? dateRange
+        : getDateRange(selectedFilter.value);
+    filtered = filtered.filter((tx) => {
+      if (!tx.created_at) return false;
+      const d = new Date(tx.created_at);
+      return (
+        (!range.start || d >= range.start) &&
+        (!range.end || d <= range.end)
+      );
     });
-  };
+  }
+  
+  // Split transactions into new and old categories
+  const { newTransactions, oldTransactions } = getTransactionSegments(filtered);
+  
+  // Update old segments list for dropdown
+  const allSegments = getAllOldSegments();
+  setOldSegmentsList(allSegments);
+  
+  // Create dropdown data for segments
+const dropdownData = allSegments.map((segment, index) => ({
+  label: `${currency}${formatCurrency(segment.previousBalance)} - ${new Date(segment.timestamp).toLocaleDateString()}`,
+  value: segment.id
+}));
+
+  setSegmentDropdownData(dropdownData);
+  
+  // Set default selected segment
+  if (allSegments.length > 0 && selectedSegmentId === null) {
+    setSelectedSegmentId(allSegments[0].id);
+  } else if (allSegments.length === 0) {
+    setSelectedSegmentId(null);
+  } else if (selectedSegmentId !== null && !allSegments.find(seg => seg.id === selectedSegmentId)) {
+    setSelectedSegmentId(allSegments[0]?.id || null);
+  }
+  
+  // Apply sorting to each category
+  setFilteredTransactions({
+    new: sortTransactions(newTransactions),
+    old: sortTransactions(oldTransactions)
+  });
+};
   
   useEffect(filterTransactions, [
     transactions,
     selectedFilter,
     dateRange,
+    selectedSort,
   ]);
+  
   
   const handleFilterChange = (filter: FilterType) => {
     setSelectedFilter(filter);
@@ -289,184 +569,292 @@ export default function AllTransactionsScreen() {
     );
   };
 
-  // Restore backup
+  // Restore function with unique backup ID checking
   const restoreOldTransactions = async () => {
-    const str = await AsyncStorage.getItem(
-      `@oldTxBackup_${customer.id}`
-    );
-    if (!str) {
-      Alert.alert("No Backup Found");
+    const latestBackupId = await AsyncStorage.getItem(`@latestBackupId_${customer.id}`);
+    
+    if (!latestBackupId) {
+      Alert.alert("No Backup Found", "There are no backups available to restore.");
       return;
     }
-    const oldTx: Transaction[] = JSON.parse(str);
+    
+    const str = await AsyncStorage.getItem(`@oldTxBackup_${customer.id}_${latestBackupId}`);
+    
+    if (!str) {
+      Alert.alert("No Backup Found", "The backup file could not be found.");
+      return;
+    }
+    
+    const backupData = JSON.parse(str);
+    
+    const restoredBackups = await getRestoredBackupIds();
+    if (restoredBackups.includes(latestBackupId)) {
+      Alert.alert(
+        "Already Restored",
+        `This backup has already been restored. The balance was already adjusted.\n\n` +
+        `Backup ID: ${latestBackupId.substring(7, 30)}...\n` +
+        `Created: ${new Date(backupData.timestamp).toLocaleString()}\n` +
+        `Transactions: ${backupData.transactions.length}\n` +
+        `Total Amount: ${currency}${formatCurrency(backupData.totalAmount)}\n\n` +
+        `The transactions are already in your list and the balance has been updated.`
+      );
+      return;
+    }
+    
+    const oldTx: Transaction[] = backupData.transactions;
+    
     const ok = await confirmAsync(
       "Confirm Restore",
-      "Insert old transactions?"
+      `Restore ${oldTx.length} transaction(s) and add ${currency}${formatCurrency(backupData.totalAmount)} to balance?\n\nBackup created: ${new Date(backupData.timestamp).toLocaleString()}`
     );
     if (!ok) return;
-    for (const tx of oldTx) {
-      await supabase
-        .from("transactions")
-        .upsert(tx, { onConflict: "transaction_id" });
+    
+    try {
+      for (const tx of oldTx) {
+        const { backup_id, ...txWithoutBackupId } = tx as any;
+        
+        const { error } = await supabase
+          .from("transactions")
+          .upsert(txWithoutBackupId, { onConflict: "transaction_id" });
+        
+        if (error) {
+          console.error("Error restoring transaction:", error);
+        }
+      }
+      
+      const totalToRestore = backupData.totalAmount;
+      const newBalance = currentBalance + totalToRestore;
+      
+      const { error: balanceError } = await supabase
+        .from("customers")
+        .update({ balance: newBalance })
+        .eq("id", customer.id);
+      
+      if (balanceError) {
+        console.error("Error updating balance:", balanceError);
+        Alert.alert("Error", "Failed to update balance");
+        return;
+      }
+      
+      await markBackupAsRestored(latestBackupId);
+      
+      backupData.restored = true;
+      await AsyncStorage.setItem(
+        `@oldTxBackup_${customer.id}_${latestBackupId}`,
+        JSON.stringify(backupData)
+      );
+      
+      setCurrentBalance(newBalance);
+      
+      await fetchTransactions();
+      await fetchCustomerBalance();
+      
+      Alert.alert(
+        "Restore Complete", 
+        `${oldTx.length} transaction(s) restored!\n\nOld Balance: ${currency}${formatCurrency(currentBalance)}\nRestored Amount: ${currency}${formatCurrency(totalToRestore)}\nNew Balance: ${currency}${formatCurrency(newBalance)}\n\nThis backup has been marked as restored and cannot be restored again.`
+      );
+      
+      setIsRestored(true);
+    } catch (error) {
+      console.error("Error during restore:", error);
+      Alert.alert("Error", "Failed to restore transactions. Please try again.");
     }
-    Alert.alert("Restore Complete");
-    fetchTransactions();
-    fetchCustomerBalance();
-    setIsRestored(true);
   };
 
-  // Delete selected transactions
-// Updated function to handle delete all transactions based on active tab
-const handleDeleteAll = () => {
-  // Determine which transactions to delete based on active tab
-  const tabName = activeTab === "all" ? "ALL" : 
-                 activeTab === "new" ? "NEW" : "OLD";
-  
-  Alert.alert(
-    `Delete ${tabName} Transactions`,
-    `This will delete ${tabName === "ALL" ? "ALL" : "all " + tabName.toLowerCase()} transactions. Proceed?`,
-    [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: `Delete ${tabName}`,
-        style: "destructive",
-        onPress: async () => {
-          // Always back up before deleting
-          await backupOldTransactions();
-          
-          // Get the IDs of transactions to delete based on active tab
-          let transactionsToDelete: Transaction[] = [];
-          let transactionIdsToDelete: string[] = [];
-          
-          if (activeTab === "all") {
-            transactionsToDelete = transactions;
-            transactionIdsToDelete = transactions
-              .map(tx => tx.transaction_id || "")
-              .filter(id => id !== "");
-          } else if (activeTab === "new") {
-            const { newTransactions } = getTransactionSegments(transactions);
-            transactionsToDelete = newTransactions;
-            transactionIdsToDelete = newTransactions
-              .map(tx => tx.transaction_id || "")
-              .filter(id => id !== "");
-          } else if (activeTab === "old") {
-            const { oldTransactions } = getTransactionSegments(transactions);
-            transactionsToDelete = oldTransactions;
-            transactionIdsToDelete = oldTransactions
-              .map(tx => tx.transaction_id || "")
-              .filter(id => id !== "");
-          }
-          
-          // Skip if no transactions to delete
-          if (transactionIdsToDelete.length === 0) {
-            Alert.alert("No transactions to delete");
-            return;
-          }
-          
-          // Calculate balance adjustment (only needed for "new" transactions)
-          if (activeTab === "all" || activeTab === "new") {
-            // Calculate how much to restore to balance
-            const { newTransactions } = getTransactionSegments(transactions);
-            // If deleting all, use all new transactions
-            // If deleting new only, use all new transactions
-            // If deleting old only, no balance adjustment needed
-            const transactionsAffectingBalance = activeTab === "old" as TabType ? [] : newTransactions;
+  // Delete with backup using unique IDs
+  const handleDeleteWithBackup = () => {
+    const tabName = activeTab === "new" ? "NEW" : "OLD";
+    
+    Alert.alert(
+      `Delete ${tabName} Transactions (With Backup)`,
+      `This will delete all ${tabName.toLowerCase()} transactions and create a backup. You can restore them later. Balance will NOT be changed.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: `Delete & Backup`,
+          style: "destructive",
+          onPress: async () => {
+            let transactionsToBackup: Transaction[] = [];
+            let transactionIdsToDelete: string[] = [];
             
-            const totalToRestore = transactionsAffectingBalance.reduce(
-              (sum, tx) => sum + tx.amount,
-              0
-            );
-            
-            if (totalToRestore > 0) {
-              const updated = currentBalance + totalToRestore;
-              await supabase
-                .from("customers")
-                .update({ balance: updated })
-                .eq("id", customer.id);
-              setCurrentBalance(updated);
+            if (activeTab === "new") {
+              const { newTransactions } = getTransactionSegments(transactions);
+              transactionsToBackup = newTransactions;
+              transactionIdsToDelete = newTransactions
+                .map(tx => tx.transaction_id || "")
+                .filter(id => id !== "");
+            } else if (activeTab === "old") {
+              const { oldTransactions } = getTransactionSegments(transactions);
+              transactionsToBackup = oldTransactions;
+              transactionIdsToDelete = oldTransactions
+                .map(tx => tx.transaction_id || "")
+                .filter(id => id !== "");
             }
-          }
-          
-          // Delete the transactions
-          if (transactionIdsToDelete.length > 0) {
-            await supabase
-              .from("transactions")
-              .delete()
-              .in("transaction_id", transactionIdsToDelete);
-              
-            // Update UI by removing deleted transactions
-            setTransactions(prev => 
-              prev.filter(tx => !transactionIdsToDelete.includes(tx.transaction_id || ""))
+            
+            if (transactionIdsToDelete.length === 0) {
+              Alert.alert("No transactions to delete");
+              return;
+            }
+            
+            const transactionIdString = transactionIdsToDelete.sort().join('_');
+            const backupId = `backup_${transactionIdString.substring(0, 50)}_${transactionsToBackup.length}`;
+            
+            const restoredBackups = await getRestoredBackupIds();
+            if (restoredBackups.includes(backupId)) {
+              Alert.alert(
+                "⚠️ Warning",
+                "These transactions were previously backed up and restored. They can still be restored again, but the balance will NOT be adjusted a second time.",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Continue Anyway",
+                    onPress: async () => {
+                      await performBackupAndDelete(
+                        backupId,
+                        transactionsToBackup,
+                        transactionIdsToDelete,
+                        tabName
+                      );
+                    }
+                  }
+                ]
+              );
+              return;
+            }
+            
+            await performBackupAndDelete(
+              backupId,
+              transactionsToBackup,
+              transactionIdsToDelete,
+              tabName
             );
-          }
-          
-          // Clear any selections
-          setSelectedTransactions([]);
-          
-          Alert.alert(`${tabName} transactions deleted successfully`);
+          },
         },
-      },
-    ]
-  );
-};
+      ]
+    );
+  };
 
-// Updated function to handle deletion of selected transactions
-const handleDeleteTransactions = async () => {
-  if (!selectedTransactions.length) {
-    Alert.alert("No transactions selected");
-    return;
-  }
-  
-  await backupOldTransactions();
-  
-  // Get new transactions to calculate balance adjustment
-  const { newTransactions } = getTransactionSegments(transactions);
-  const newIds = new Set(
-    newTransactions.map((tx) => tx.transaction_id)
-  );
-  
-  // Calculate balance adjustment for selected transactions that are in "new" category
-  let balanceAdjustment = 0;
-  transactions
-    .filter((tx) =>
+  // Delete permanently (no backup, cannot be restored)
+  const handleDeletePermanently = () => {
+    const tabName = activeTab === "new" ? "NEW" : "OLD";
+    
+    Alert.alert(
+      `⚠️ Delete ${tabName} Transactions Permanently`,
+      `WARNING: This will PERMANENTLY delete all ${tabName.toLowerCase()} transactions. This action CANNOT be undone and NO backup will be created.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "I Understand, Delete Permanently",
+          style: "destructive",
+          onPress: () => {
+            Alert.alert(
+              "⚠️ Final Confirmation",
+              "Are you absolutely sure? This cannot be undone.",
+              [
+                { text: "Cancel", style: "cancel" },
+                {
+                  text: "Yes, Delete Forever",
+                  style: "destructive",
+                  onPress: async () => {
+                    let transactionIdsToDelete: string[] = [];
+                    
+                    if (activeTab === "new") {
+                      const { newTransactions } = getTransactionSegments(transactions);
+                      transactionIdsToDelete = newTransactions
+                        .map(tx => tx.transaction_id || "")
+                        .filter(id => id !== "");
+                    } else if (activeTab === "old") {
+                      const { oldTransactions } = getTransactionSegments(transactions);
+                      transactionIdsToDelete = oldTransactions
+                        .map(tx => tx.transaction_id || "")
+                        .filter(id => id !== "");
+                      
+                      await AsyncStorage.removeItem(`@oldTxBackup_${customer.id}`);
+                    }
+                    
+                    if (transactionIdsToDelete.length === 0) {
+                      Alert.alert("No transactions to delete");
+                      return;
+                    }
+                    
+                    if (activeTab === "new") {
+                      const { newTransactions } = getTransactionSegments(transactions);
+                      const transactionsAffectingBalance = newTransactions;
+                      
+                      const totalToSubtract = transactionsAffectingBalance.reduce(
+                        (sum, tx) => sum + tx.amount,
+                        0
+                      );
+                      
+                      if (totalToSubtract > 0) {
+                        const updated = currentBalance - totalToSubtract;
+                        await supabase
+                          .from("customers")
+                          .update({ balance: updated })
+                          .eq("id", customer.id);
+                        setCurrentBalance(updated);
+                      }
+                    }
+                    
+                    await supabase
+                      .from("transactions")
+                      .delete()
+                      .in("transaction_id", transactionIdsToDelete);
+                      
+                    setTransactions(prev => 
+                      prev.filter(tx => !transactionIdsToDelete.includes(tx.transaction_id || ""))
+                    );
+                    
+                    setSelectedTransactions([]);
+                    
+                    Alert.alert("Permanently Deleted", `${tabName} transactions have been permanently removed and cannot be restored.`);
+                  },
+                },
+              ]
+            );
+          },
+        },
+      ]
+    );
+  };
+
+  const handleDeleteSelected = async () => {
+    if (!selectedTransactions.length) {
+      Alert.alert("No transactions selected");
+      return;
+    }
+    
+    await backupOldTransactions();
+    
+    const ok = await confirmAsync(
+      "Delete Selected",
+      `Delete ${selectedTransactions.length} transaction(s)?`
+    );
+    if (!ok) return;
+
+    const txsToDelete = transactions.filter((tx) =>
       selectedTransactions.includes(tx.transaction_id || "")
-    )
-    .forEach((tx) => {
-      if (newIds.has(tx.transaction_id)) {
-        balanceAdjustment += tx.amount;
-      }
-    });
+    );
+    const totalAmount = txsToDelete.reduce((sum, tx) => sum + tx.amount, 0);
 
-  // Update customer balance if needed
-  if (balanceAdjustment > 0) {
-    const updated = currentBalance + balanceAdjustment;
+    await supabase
+      .from("transactions")
+      .delete()
+      .in("transaction_id", selectedTransactions);
+
+    const updated = currentBalance + totalAmount;
     await supabase
       .from("customers")
       .update({ balance: updated })
       .eq("id", customer.id);
-    setCurrentBalance(updated);
-  }
 
-  // Delete selected transactions
-  await supabase
-    .from("transactions")
-    .delete()
-    .in("transaction_id", selectedTransactions);
-    
-  // Update UI
-  setTransactions((prev) =>
-    prev.filter(
-      (tx) => !selectedTransactions.includes(tx.transaction_id || "")
-    )
-  );
-  setSelectedTransactions([]);
-  
-  Alert.alert("Selected transactions deleted successfully");
-};
+    setCurrentBalance(updated);
+    setSelectedTransactions([]);
+    fetchTransactions();
+  };
 
   // --- OFFLINE QUEUE LOGIC ---
 
-  // Add to queue in storage
   const enqueueTransaction = async (
     tx: Omit<Transaction, "transaction_id">
   ) => {
@@ -476,61 +864,79 @@ const handleDeleteTransactions = async () => {
     await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
   };
 
-  // Add or queue a new transaction
-  const handleAddTransaction = async () => {
-    const amount = parseFloat(newAmount);
-    if (!amount || amount <= 0) {
-      Alert.alert("Invalid Amount");
-      return;
-    }
-    if (amount > currentBalance) {
-      Alert.alert("Exceeds Balance");
-      return;
-    }
+const handleAddTransaction = async () => {
+  const amount = parseFloat(newAmount);
+  if (!amount || amount <= 0) {
+    Alert.alert("Invalid Amount");
+    return;
+  }
+  if (amount > currentBalance) {
+    Alert.alert("Exceeds Balance");
+    return;
+  }
 
-    const txPayload: Omit<Transaction, "transaction_id"> = {
-      customer_id: customer.id,
-      amount,
-      old_balance: currentBalance,
-      balance_after: currentBalance - amount,
-      created_at: (dateRange.start ?? new Date()).toISOString(),
-    };
+  const oldBalance = currentBalance;
+  const balanceAfter = currentBalance - amount;
 
-    if (!isConnected) {
-      // offline: queue + optimistically update UI
-      await enqueueTransaction(txPayload);
-      setCurrentBalance(currentBalance - amount);
-      setTransactions((prev) => [
-        { ...txPayload, transaction_id: `queued-${Date.now()}` },
-        ...prev,
-      ]);
-      setNewAmount("");
-      setAddModalVisible(false);
-      return;
-    }
-
-    // online: send immediately
-    const { data, error } = await supabase
-      .from("transactions")
-      .insert([txPayload])
-      .select();
-    if (!error && data?.[0]) {
-      await supabase
-        .from("customers")
-        .update({ balance: txPayload.balance_after })
-        .eq("id", customer.id);
-      setCurrentBalance(txPayload.balance_after ?? 0);
-      setNewAmount("");
-      setAddModalVisible(false);
-      fetchTransactions();
-    } else {
-      Alert.alert("Failed to add transaction");
-    }
+  // EXPLICITLY set all values - DON'T let Supabase auto-generate anything
+  const txPayload = {
+    customer_id: customer.id,
+    amount: amount,
+    old_balance: oldBalance,
+    balance_after: balanceAfter,
+    created_at: new Date().toISOString(),
   };
 
+  console.log("=== INSERTING TRANSACTION ===");
+  console.log("Payload:", JSON.stringify(txPayload, null, 2));
+
+  if (!isConnected) {
+    await enqueueTransaction(txPayload);
+    setCurrentBalance(balanceAfter);
+    setTransactions((prev) => [
+      { ...txPayload, transaction_id: `queued-${Date.now()}` },
+      ...prev,
+    ]);
+    setNewAmount("");
+    setAddModalVisible(false);
+    return;
+  }
+
+  // Use .insert() with explicit column names
+  const { data, error } = await supabase
+    .from("transactions")
+    .insert([{
+      customer_id: txPayload.customer_id,
+      amount: txPayload.amount,
+      old_balance: txPayload.old_balance,
+      balance_after: txPayload.balance_after,
+      created_at: txPayload.created_at
+    }])
+    .select();
+    
+  console.log("=== SUPABASE RESPONSE ===");
+  console.log("Data:", JSON.stringify(data, null, 2));
+  console.log("Error:", error);
+    
+  if (!error && data?.[0]) {
+    console.log("Inserted old_balance:", data[0].old_balance);
+    console.log("Inserted balance_after:", data[0].balance_after);
+    
+    await supabase
+      .from("customers")
+      .update({ balance: balanceAfter })
+      .eq("id", customer.id);
+      
+    setCurrentBalance(balanceAfter);
+    setNewAmount("");
+    setAddModalVisible(false);
+    fetchTransactions();
+  } else {
+    Alert.alert("Failed to add transaction", error?.message || "Unknown error");
+  }
+};
   // --- CONNECTIVITY & SYNC ---
 
-  // Listen for changes
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       setIsConnected(!!state.isConnected);
@@ -538,7 +944,6 @@ const handleDeleteTransactions = async () => {
     return () => unsub();
   }, []);
 
-  // Sync queue when back online
   useEffect(() => {
     if (!isConnected) return;
 
@@ -562,18 +967,17 @@ const handleDeleteTransactions = async () => {
     })();
   }, [isConnected]);
 
-  // Calculate totals for currently visible transactions based on active tab
-  const getVisibleTransactions = () => {
-    switch (activeTab) {
-      case "new":
-        return filteredTransactions.new;
-      case "old":
-        return filteredTransactions.old;
-      case "all":
-      default:
-        return filteredTransactions.all;
+ const getVisibleTransactions = () => {
+  if (activeTab === "new") {
+    return filteredTransactions.new;
+  } else {
+    // For old tab, only return transactions from the selected segment
+    if (selectedSegmentId !== null) {
+      return sortTransactions(getTransactionsForSegment(selectedSegmentId));
     }
-  };
+    return [];
+  }
+};
   
   const visibleTransactions = getVisibleTransactions();
   const visibleCount = visibleTransactions.length;
@@ -582,43 +986,46 @@ const handleDeleteTransactions = async () => {
     0
   );
   
-  // Render individual transaction item
-  const renderTransactionItem = (tx: Transaction, type: 'new' | 'old') => (
-    <View key={tx.transaction_id} style={styles.transactionItem}>
-      <Image
-        source={{ uri: "https://via.placeholder.com/40" }}
-        style={styles.avatar}
-      />
-      <View style={styles.transactionInfo}>
-        <Text style={styles.dateText}>
-          {new Date(tx.created_at!).toLocaleDateString()}
-        </Text>
-        <Text style={styles.amountText}>
-          {currency}
-          {formatCurrency(tx.amount)}
-        </Text>
+const renderTransactionItem = (tx: Transaction, type: 'new' | 'old') => (
+  <View key={tx.transaction_id} style={styles.transactionItem}>
+    <View style={styles.transactionInfo}>
+      <Text style={styles.dateText}>
+        {new Date(tx.created_at!).toLocaleDateString()}
+      </Text>
+      <Text style={styles.amountText}>
+        {currency}
+        {formatCurrency(tx.amount)}
+      </Text>
+      {/* Only show balance calculation for NEW transactions */}
+      {type === 'new' && (
         <Text style={styles.balanceText}>
           {currency}
           {formatCurrency(tx.old_balance ?? 0)} -{" "}
           {currency}
           {formatCurrency(tx.amount)} ={" "}
           {currency}
-          {formatCurrency((tx.old_balance ?? 0) - tx.amount)}
+          {formatCurrency(tx.balance_after ?? 0)}
         </Text>
-      </View>
-      <TouchableOpacity
-        onPress={() => toggleSelection(tx.transaction_id || "")}
-      >
-        <Text style={styles.checkbox}>
-          {selectedTransactions.includes(tx.transaction_id || "") ? "☑" : "☐"}
+      )}
+      {/* For OLD transactions, ONLY show the payment date - NO BALANCE INFO */}
+      {type === 'old' && (
+        <Text style={styles.balanceText}>
+          Payment: {currency}{formatCurrency(tx.amount)}
         </Text>
-      </TouchableOpacity>
+      )}
     </View>
-  );
+    <TouchableOpacity
+      onPress={() => toggleSelection(tx.transaction_id || "")}
+    >
+      <Text style={styles.checkbox}>
+        {selectedTransactions.includes(tx.transaction_id || "") ? "☑" : "☐"}
+      </Text>
+    </TouchableOpacity>
+  </View>
+);
 
   return (
     <ScrollView style={styles.container}>
-      {/* Offline banner */}
       {!isConnected && (
         <View style={styles.offlineBanner}>
           <Text style={styles.offlineText}>
@@ -633,16 +1040,7 @@ const handleDeleteTransactions = async () => {
           : `${currency}${formatCurrency(currentBalance)} Balance`}
       </Text>
 
-      {/* Tab Navigation */}
       <View style={styles.tabContainer}>
-        <TouchableOpacity 
-          style={[styles.tab, activeTab === "all" && styles.activeTab]} 
-          onPress={() => setActiveTab("all")}
-        >
-          <Text style={[styles.tabText, activeTab === "all" && styles.activeTabText]}>
-            All Transactions
-          </Text>
-        </TouchableOpacity>
         <TouchableOpacity 
           style={[styles.tab, activeTab === "new" && styles.activeTab]} 
           onPress={() => setActiveTab("new")}
@@ -661,7 +1059,6 @@ const handleDeleteTransactions = async () => {
         </TouchableOpacity>
       </View>
 
-      {/* Filter */}
       <View style={styles.filterContainer}>
         <Dropdown
           style={styles.dropdown}
@@ -692,50 +1089,122 @@ const handleDeleteTransactions = async () => {
           )}
       </View>
 
-      {/* Totals - Updated to show visible transaction totals */}
-      <View style={styles.totalContainer}>
-        <Text style={styles.totalText}>
-          {activeTab === "all" ? "Total" : activeTab === "new" ? "New" : "Old"} Transactions: {visibleCount}
-        </Text>
-        <Text style={styles.totalText}>
-          {activeTab === "all" ? "Total" : activeTab === "new" ? "New" : "Old"} Amount: {currency}
-          {formatCurrency(visibleAmount)}
-        </Text>
-      </View>
-
-      {/* Action Buttons */}
-      <View style={styles.buttonRow}>
+      <View style={styles.sortContainer}>
         <TouchableOpacity
-          style={[
-            styles.button,
-            isConnected ? styles.addButton : styles.disabledButton,
-          ]}
-          onPress={() => setAddModalVisible(true)}
-          disabled={!isConnected}
+          style={styles.sortButton}
+          onPress={() => setShowSortDropdown(!showSortDropdown)}
         >
-          <Text style={styles.buttonText}>
-            {isConnected ? "Add Transaction" : "Queue Transaction"}
-          </Text>
+          <AntDesign name="swap" size={16} color="white" style={styles.sortIcon} />
+          <Text style={styles.sortButtonText}>{getSelectedSortLabel()}</Text>
+          <AntDesign 
+            name={showSortDropdown ? "up" : "down"} 
+            size={16} 
+            color="white" 
+            style={styles.sortArrow}
+          />
         </TouchableOpacity>
-
-        {selectedTransactions.length > 0 && (
-          <TouchableOpacity
-            style={[styles.button, styles.deleteButton]}
-            onPress={handleDeleteTransactions}
-          >
-            <Text style={styles.buttonText}>Delete Selected</Text>
-          </TouchableOpacity>
+        
+        {showSortDropdown && (
+          <View style={styles.dropdownOptions}>
+            {sortOptions.map((sort) => (
+              <TouchableOpacity
+                key={sort.value}
+                style={[
+                  styles.dropdownOption,
+                  selectedSort === sort.value && styles.activeDropdownOption
+                ]}
+                onPress={() => handleSortPress(sort.value)}
+              >
+                <Text
+                  style={[
+                    styles.dropdownOptionText,
+                    selectedSort === sort.value && styles.activeDropdownOptionText
+                  ]}
+                >
+                  {sort.label}
+                </Text>
+                {selectedSort === sort.value && (
+                  <Text style={styles.checkmark}>✓</Text>
+                )}
+              </TouchableOpacity>
+            ))}
+          </View>
         )}
-
-        <TouchableOpacity
-          style={[styles.button, styles.deleteButton]}
-          onPress={handleDeleteAll}
-        >
-          <Text style={styles.buttonText}>Delete All</Text>
-        </TouchableOpacity>
       </View>
 
-      {/* Backup & Old Transactions Navigation */}
+     <View style={styles.totalContainer}>
+  <Text style={styles.totalText}>
+    {activeTab === "new" ? "New" : "Old"} Transactions: {visibleCount}
+  </Text>
+  <Text style={styles.totalText}>
+    Total Amount Paid: {currency}{formatCurrency(visibleAmount)}
+  </Text>
+ </View>
+
+      {activeTab === "new" && (
+        <>
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[
+                styles.button,
+                isConnected ? styles.addButton : styles.disabledButton,
+              ]}
+              onPress={() => setAddModalVisible(true)}
+              disabled={!isConnected}
+            >
+              <Text style={styles.buttonText}>
+                {isConnected ? "Add Transaction" : "Queue Transaction"}
+              </Text>
+            </TouchableOpacity>
+
+            {selectedTransactions.length > 0 && (
+              <TouchableOpacity
+                style={[styles.button, styles.deleteButton]}
+                onPress={handleDeleteSelected}
+              >
+                <Text style={styles.buttonText}>Delete Selected</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[styles.button, styles.deleteWithBackupButton]}
+              onPress={handleDeleteWithBackup}
+            >
+              <Text style={styles.buttonText}>Delete with Backup</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.button, styles.deletePermanentButton]}
+              onPress={handleDeletePermanently}
+            >
+              <Text style={styles.buttonText}>⚠️ Delete Permanently</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
+
+      {activeTab === "old" && (
+        <>
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[styles.button, styles.deleteWithBackupButton]}
+              onPress={handleDeleteWithBackup}
+            >
+              <Text style={styles.buttonText}>Delete with Backup</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.button, styles.deletePermanentButton]}
+              onPress={handleDeletePermanently}
+            >
+              <Text style={styles.buttonText}>⚠️ Delete Permanently</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
+
       <View style={styles.backupRestoreContainer}>
         <TouchableOpacity
           style={[styles.button, styles.restoreButton]}
@@ -752,61 +1221,100 @@ const handleDeleteTransactions = async () => {
         </TouchableOpacity>
       </View>
 
-      {/* Display transactions based on active tab */}
+      
+
       <View style={styles.transactionsContainer}>
-        {/* New Transactions Section */}
-        {(activeTab === 'all' || activeTab === 'new') && (
+        {activeTab === "old" ? (
+          oldSegmentsList.length > 0 ? (
+            <>
+              <View style={styles.previousBalanceDropdownContainer}>
+                <Text style={styles.dropdownLabel}>Select Transaction History:</Text>
+                <Dropdown
+                  style={styles.balanceDropdown}
+                  data={segmentDropdownData}
+                  labelField="label"
+                  valueField="value"
+                  value={selectedSegmentId}
+                  onChange={(item) => {
+                    console.log("Selected segment:", item.value);
+                    setSelectedSegmentId(item.value);
+                  }}
+                  renderLeftIcon={() => (
+                    <AntDesign
+                      name="wallet"
+                      size={20}
+                      color="#4CAF50"
+                      style={styles.icon}
+                    />
+                  )}
+                  selectedTextStyle={styles.balanceDropdownText}
+                  placeholderStyle={styles.balanceDropdownText}
+                  placeholder="Select History"
+                />
+              </View>
+              
+              {selectedSegmentId !== null && (() => {
+                const segmentTransactions = sortTransactions(getTransactionsForSegment(selectedSegmentId));
+                const segment = oldSegmentsList.find(seg => seg.id === selectedSegmentId);
+                
+                console.log("=== RENDERING OLD TRANSACTIONS ===");
+                console.log("Selected segment ID:", selectedSegmentId);
+                console.log("Segment transactions found:", segmentTransactions.length);
+                console.log("Segment transaction IDs:", segmentTransactions.map(tx => tx.transaction_id));
+                
+                if (segmentTransactions.length === 0 || !segment) {
+                  return (
+                    <View style={styles.emptyContainer}>
+                      <Text style={styles.emptyText}>
+                        No transactions found for this segment
+                      </Text>
+                    </View>
+                  );
+                }
+                
+                return (
+                  <View style={styles.balanceSegment}>
+                    <View style={styles.previousBalanceHeader}>
+                      <Text style={styles.previousBalanceLabel}>Previous Balance:</Text>
+                      <Text style={styles.previousBalanceAmount}>
+                        {currency}{formatCurrency(segment.previousBalance)}
+                      </Text>
+                    </View>
+                    
+                    {segmentTransactions.map((tx) => {
+                      console.log("Rendering transaction:", tx.transaction_id);
+                      return renderTransactionItem(tx, "old");
+                    })}
+                    
+                    <View style={styles.paidBadgeContainer}>
+                      <Text style={styles.paidBadgeText}>✓ PAID</Text>
+                    </View>
+                  </View>
+                );
+              })()}
+            </>
+          ) : (
+            <View style={styles.emptyContainer}>
+              <Text style={styles.emptyText}>
+                No old transactions found
+              </Text>
+            </View>
+          )
+        ) : (
           <>
-            {filteredTransactions.new.length > 0 && activeTab === 'all' && (
-              <Text style={styles.sectionHeader}>New Transactions</Text>
-            )}
-            
-            {filteredTransactions.new.length > 0 ? (
-              filteredTransactions.new
-                .slice()
-                .map((tx) => renderTransactionItem(tx, 'new'))
+            {visibleTransactions.length > 0 ? (
+              visibleTransactions.map((tx) => renderTransactionItem(tx, activeTab))
             ) : (
-              activeTab === 'new' && (
-                <View style={styles.emptyContainer}>
-                  <Text style={styles.emptyText}>No new transactions found</Text>
-                </View>
-              )
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>
+                  No new transactions found
+                </Text>
+              </View>
             )}
           </>
-        )}
-        
-        {/* Old Transactions Section */}
-        {(activeTab === 'all' || activeTab === 'old') && (
-          <>
-            {filteredTransactions.old.length > 0 && activeTab === 'all' && (
-              <Text style={styles.sectionHeader}>Old Transactions</Text>
-            )}
-            
-            {filteredTransactions.old.length > 0 ? (
-              filteredTransactions.old
-                .slice()
-                .map((tx) => renderTransactionItem(tx, 'old'))
-            ) : (
-              activeTab === 'old' && (
-                <View style={styles.emptyContainer}>
-                  <Text style={styles.emptyText}>No old transactions found</Text>
-                </View>
-              )
-            )}
-          </>
-        )}
-        
-        {/* Empty state for 'all' tab when no transactions */}
-        {activeTab === 'all' && 
-         filteredTransactions.new.length === 0 && 
-         filteredTransactions.old.length === 0 && (
-          <View style={styles.emptyContainer}>
-            <Text style={styles.emptyText}>No transactions found</Text>
-          </View>
         )}
       </View>
 
-      {/* Date Picker */}
       <DatePickerModal
         locale="en"
         mode="range"
@@ -820,7 +1328,6 @@ const handleDeleteTransactions = async () => {
         }}
       />
 
-      {/* Add Modal */}
       <Modal visible={addModalVisible} transparent animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -881,7 +1388,6 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     marginVertical: 12,
   },
-  // Tab styles
   tabContainer: {
     flexDirection: "row",
     marginBottom: 16,
@@ -919,6 +1425,68 @@ const styles = StyleSheet.create({
   placeholderText: { color: "#999", fontSize: 16 },
   icon: { marginRight: 8 },
   dateRangeText: { color: "#999", textAlign: "center", marginTop: 8 },
+  sortContainer: {
+    position: "relative",
+    marginBottom: 16,
+  },
+  sortButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#2A2F35",
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  sortIcon: {
+    marginRight: 8,
+  },
+  sortButtonText: {
+    flex: 1,
+    color: "#FFF",
+    fontSize: 16,
+  },
+  sortArrow: {
+    marginLeft: 8,
+  },
+  dropdownOptions: {
+    position: "absolute",
+    top: 52,
+    left: 0,
+    right: 0,
+    backgroundColor: "#2A2F35",
+    borderRadius: 8,
+    zIndex: 1000,
+    elevation: 5,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+  },
+  dropdownOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1C1F24",
+  },
+  activeDropdownOption: {
+    backgroundColor: "#1C1F24",
+  },
+  dropdownOptionText: {
+    color: "#FFF",
+    fontSize: 16,
+  },
+  activeDropdownOptionText: {
+    color: "#4CAF50",
+    fontWeight: "600",
+  },
+  checkmark: {
+    color: "#4CAF50",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
   totalContainer: {
     backgroundColor: "#1C1F24",
     borderRadius: 8,
@@ -931,6 +1499,12 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 16,
     gap: 8,
+  },
+  deleteWithBackupButton: { 
+    backgroundColor: "#FF9800"
+  },
+  deletePermanentButton: { 
+    backgroundColor: "#D32F2F"
   },
   backupRestoreContainer: {
     flexDirection: "row",
@@ -955,6 +1529,21 @@ const styles = StyleSheet.create({
   },
   avatar: { width: 40, height: 40, borderRadius: 20, marginRight: 16 },
   transactionInfo: { flex: 1 },
+  dateAndIdRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 4,
+  },
+  backupIdBadge: {
+    fontSize: 10,
+    color: "#FF9800",
+    backgroundColor: "#2A2F35",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    fontFamily: "monospace",
+  },
   dateText: { color: "#999", fontSize: 12 },
   amountText: {
     color: "#4CAF50",
@@ -1001,7 +1590,7 @@ const styles = StyleSheet.create({
   modalButton: { flex: 1, padding: 12, borderRadius: 8, alignItems: "center" },
   cancelButton: { backgroundColor: "#F44336" },
   submitButton: { backgroundColor: "#4CAF50" },
-   transactionsContainer: {
+  transactionsContainer: {
     marginBottom: 20,
   },
   sectionHeader: {
@@ -1012,7 +1601,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     paddingHorizontal: 4,
   },
-   emptyContainer: {
+  emptyContainer: {
     padding: 20,
     alignItems: "center",
     justifyContent: "center",
@@ -1020,6 +1609,89 @@ const styles = StyleSheet.create({
   emptyText: {
     color: "#999",
     fontSize: 16,
-  }
+  },
+  balanceSegment: {
+    marginBottom: 24,
+  },
+  previousBalanceDropdownContainer: {
+    marginBottom: 16,
+  },
+  dropdownLabel: {
+    color: "#FFF",
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 8,
+  },
+  previousBalanceHeader: {
+    backgroundColor: "#2A2F35",
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 12,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderLeftWidth: 4,
+    borderLeftColor: "#4CAF50",
+  },
+  previousBalanceContainer: {
+    backgroundColor: "#2A2F35",
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 16,
+    borderLeftWidth: 4,
+    borderLeftColor: "#4CAF50",
+  },
+  previousBalanceLabel: {
+    color: "#FFF",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  dropdownWrapper: {
+    width: "100%",
+  },
+  balanceDropdown: {
+    backgroundColor: "#1C1F24",
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    height: 50,
+    borderWidth: 1,
+    borderColor: "#4CAF50",
+  },
+  balanceDropdownText: {
+    color: "#4CAF50",
+    fontSize: 18,
+    fontWeight: "bold",
+  },
+  previousBalanceAmount: {
+    color: "#4CAF50",
+    fontSize: 20,
+    fontWeight: "bold",
+  },
+  paidBadgeContainer: {
+    backgroundColor: "#4CAF50",
+    borderRadius: 8,
+    padding: 16,
+    marginTop: 16,
+    alignItems: "center",
+  },
+  paidBadgeText: {
+    color: "#FFF",
+    fontSize: 18,
+    fontWeight: "bold",
+    letterSpacing: 2,
+  },
+  debugContainer: {
+    backgroundColor: "#2A2F35",
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+    borderLeftWidth: 4,
+    borderLeftColor: "#FF9800",
+  },
+  debugText: {
+    color: "#FFD700",
+    fontSize: 12,
+    fontFamily: "monospace",
+    marginVertical: 2,
+  },
 });
-    

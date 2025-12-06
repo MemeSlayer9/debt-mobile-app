@@ -66,7 +66,33 @@ export default function CustomerDetailsScreen() {
   const [newBalance, setNewBalance] = useState("");
   // Add confirmation modal for deletion
   const [deleteConfirmModalVisible, setDeleteConfirmModalVisible] = useState(false);
+  const [editNameModalVisible, setEditNameModalVisible] = useState(false);
+const [newCustomerName, setNewCustomerName] = useState("");
 
+
+  const handleEditName = async () => {
+  if (!newCustomerName.trim()) {
+    Alert.alert("Missing Name", "Please enter a customer name.");
+    return;
+  }
+  
+  const { error } = await supabase
+    .from("customers")
+    .update({ name: newCustomerName.trim() })
+    .eq("id", currentCustomer.id);
+  
+  if (error) {
+    console.error("Error updating name:", error);
+    Alert.alert("Error", "Could not update name. Please try again.");
+    return;
+  }
+
+  setCurrentCustomer({ ...currentCustomer, name: newCustomerName.trim() });
+  setEditNameModalVisible(false);
+  setNewCustomerName("");
+  
+  Alert.alert("Success", "Customer name has been updated.");
+};
   const storeTransactions = async (txns: Transaction[]) => {
     try {
       await AsyncStorage.setItem("transactions", JSON.stringify(txns));
@@ -287,8 +313,41 @@ export default function CustomerDetailsScreen() {
     <ScrollView style={styles.container}>
       {/* Header Section */}
       <View style={styles.headerContainer}>
-        <Text style={styles.userName}>{currentCustomer.name}</Text>
+  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+    <Text style={styles.userName}>{currentCustomer.name}</Text>
+    <TouchableOpacity
+      style={styles.editNameButton}
+      onPress={() => {
+        setNewCustomerName(currentCustomer.name);
+        setEditNameModalVisible(true);
+      }}
+    >
+      <Text style={styles.editNameButtonText}>Edit Name</Text>
+    </TouchableOpacity>
+  </View>
+</View> 
+<Modal visible={editNameModalVisible} transparent={true} animationType="slide">
+  <View style={styles.modalOverlay}>
+    <View style={styles.modalContainer}>
+      <Text style={styles.modalTitle}>Edit Customer Name</Text>
+      <TextInput
+        style={styles.input}
+        placeholder="Enter new customer name"
+        placeholderTextColor="#AAAAAA"
+        value={newCustomerName}
+        onChangeText={(text) => setNewCustomerName(text)}
+      />
+      <View style={styles.modalButtons}>
+        <TouchableOpacity style={[styles.modalButton, styles.submitButton]} onPress={handleEditName}>
+          <Text style={styles.modalButtonText}>Update</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.modalButton, styles.cancelButton]} onPress={() => setEditNameModalVisible(false)}>
+          <Text style={styles.modalButtonText}>Cancel</Text>
+        </TouchableOpacity>
       </View>
+    </View>
+  </View>
+</Modal>
 
       {/* Balance Section */}
       <View style={styles.balanceContainer}>
@@ -595,4 +654,15 @@ const styles = StyleSheet.create({
   cancelButton: { backgroundColor: "#F44336" },
   deleteButton: { backgroundColor: "#FF5722" },
   modalButtonText: { color: "#FFFFFF", fontSize: 16 },
+  editNameButton: {
+  backgroundColor: "#2196F3",
+  padding: 8,
+  paddingHorizontal: 12,
+  borderRadius: 6,
+},
+editNameButtonText: {
+  color: "#FFFFFF",
+  fontSize: 14,
+  fontWeight: "600",
+},
 });
