@@ -569,59 +569,93 @@ const dropdownData = allSegments.map((segment, index) => ({
     );
   };
 
-  // Restore function with unique backup ID checking
-  const restoreOldTransactions = async () => {
-    const latestBackupId = await AsyncStorage.getItem(`@latestBackupId_${customer.id}`);
-    
-    if (!latestBackupId) {
-      Alert.alert("No Backup Found", "There are no backups available to restore.");
-      return;
-    }
-    
-    const str = await AsyncStorage.getItem(`@oldTxBackup_${customer.id}_${latestBackupId}`);
-    
-    if (!str) {
-      Alert.alert("No Backup Found", "The backup file could not be found.");
-      return;
-    }
-    
-    const backupData = JSON.parse(str);
-    
-    const restoredBackups = await getRestoredBackupIds();
-    if (restoredBackups.includes(latestBackupId)) {
-      Alert.alert(
-        "Already Restored",
-        `This backup has already been restored. The balance was already adjusted.\n\n` +
-        `Backup ID: ${latestBackupId.substring(7, 30)}...\n` +
-        `Created: ${new Date(backupData.timestamp).toLocaleString()}\n` +
-        `Transactions: ${backupData.transactions.length}\n` +
-        `Total Amount: ${currency}${formatCurrency(backupData.totalAmount)}\n\n` +
-        `The transactions are already in your list and the balance has been updated.`
-      );
-      return;
-    }
-    
-    const oldTx: Transaction[] = backupData.transactions;
-    
-    const ok = await confirmAsync(
-      "Confirm Restore",
-      `Restore ${oldTx.length} transaction(s) and add ${currency}${formatCurrency(backupData.totalAmount)} to balance?\n\nBackup created: ${new Date(backupData.timestamp).toLocaleString()}`
+ 
+// Replace your restoreOldTransactions function with this:
+
+const restoreOldTransactions = async () => {
+  const latestBackupId = await AsyncStorage.getItem(`@latestBackupId_${customer.id}`);
+  
+  if (!latestBackupId) {
+    Alert.alert("No Backup Found", "There are no backups available to restore.");
+    return;
+  }
+  
+  const str = await AsyncStorage.getItem(`@oldTxBackup_${customer.id}_${latestBackupId}`);
+  
+  if (!str) {
+    Alert.alert("No Backup Found", "The backup file could not be found.");
+    return;
+  }
+  
+  const backupData = JSON.parse(str);
+  const oldTx: Transaction[] = backupData.transactions;
+  
+  // Check if transactions already exist in database
+  const txIds = oldTx.map(tx => tx.transaction_id).filter(id => id);
+  const { data: existingTxs } = await supabase
+    .from("transactions")
+    .select("transaction_id")
+    .in("transaction_id", txIds);
+  
+  if (existingTxs && existingTxs.length === oldTx.length) {
+    Alert.alert(
+      "Already in List",
+      `These transactions are already in your transaction list.\n\n` +
+      `Transactions: ${backupData.transactions.length}\n` +
+      `Total Amount: ${currency}${formatCurrency(backupData.totalAmount)}\n\n` +
+      `No need to restore.`
     );
-    if (!ok) return;
-    
-    try {
-      for (const tx of oldTx) {
-        const { backup_id, ...txWithoutBackupId } = tx as any;
-        
-        const { error } = await supabase
-          .from("transactions")
-          .upsert(txWithoutBackupId, { onConflict: "transaction_id" });
-        
-        if (error) {
-          console.error("Error restoring transaction:", error);
-        }
-      }
+    return;
+  }
+  
+  // *** KEY CHANGE: Check which tab we're on ***
+  const isRestoringFromNewTab = activeTab === "new";
+  
+  // Check if this backup contains OLD transactions (balance_after = 0 for last transaction)
+  const isOldTransactionsBackup = oldTx.length > 0 && 
+    (oldTx[oldTx.length - 1].balance_after === 0 || oldTx[oldTx.length - 1].balance_after === null);
+  
+  // *** ENFORCE TAB-SPECIFIC RESTORE ***
+  if (isRestoringFromNewTab && isOldTransactionsBackup) {
+    Alert.alert(
+      "Wrong Tab",
+      "You're trying to restore OLD (paid) transactions from the NEW tab.\n\n" +
+      "Please switch to the OLD TRANSACTIONS tab to restore these."
+    );
+    return;
+  }
+  
+  if (!isRestoringFromNewTab && !isOldTransactionsBackup) {
+    Alert.alert(
+      "Wrong Tab",
+      "You're trying to restore NEW (unpaid) transactions from the OLD tab.\n\n" +
+      "Please switch to the NEW TRANSACTIONS tab to restore these."
+    );
+    return;
+  }
+  
+  const confirmMessage = isOldTransactionsBackup
+    ? `Restore ${oldTx.length} old transaction(s)?\n\nNote: These are already-paid transactions. Your current balance will NOT be changed.\n\nBackup created: ${new Date(backupData.timestamp).toLocaleString()}`
+    : `Restore ${oldTx.length} transaction(s) and add ${currency}${formatCurrency(backupData.totalAmount)} to balance?\n\nBackup created: ${new Date(backupData.timestamp).toLocaleString()}`;
+  
+  const ok = await confirmAsync("Confirm Restore", confirmMessage);
+  if (!ok) return;
+  
+  try {
+    for (const tx of oldTx) {
+      const { backup_id, ...txWithoutBackupId } = tx as any;
       
+      const { error } = await supabase
+        .from("transactions")
+        .upsert(txWithoutBackupId, { onConflict: "transaction_id" });
+      
+      if (error) {
+        console.error("Error restoring transaction:", error);
+      }
+    }
+    
+    // Only update balance if these are NEW transactions (not old/paid transactions)
+    if (!isOldTransactionsBackup) {
       const totalToRestore = backupData.totalAmount;
       const newBalance = currentBalance + totalToRestore;
       
@@ -636,30 +670,32 @@ const dropdownData = allSegments.map((segment, index) => ({
         return;
       }
       
-      await markBackupAsRestored(latestBackupId);
-      
-      backupData.restored = true;
-      await AsyncStorage.setItem(
-        `@oldTxBackup_${customer.id}_${latestBackupId}`,
-        JSON.stringify(backupData)
-      );
-      
       setCurrentBalance(newBalance);
-      
-      await fetchTransactions();
-      await fetchCustomerBalance();
-      
-      Alert.alert(
-        "Restore Complete", 
-        `${oldTx.length} transaction(s) restored!\n\nOld Balance: ${currency}${formatCurrency(currentBalance)}\nRestored Amount: ${currency}${formatCurrency(totalToRestore)}\nNew Balance: ${currency}${formatCurrency(newBalance)}\n\nThis backup has been marked as restored and cannot be restored again.`
-      );
-      
-      setIsRestored(true);
-    } catch (error) {
-      console.error("Error during restore:", error);
-      Alert.alert("Error", "Failed to restore transactions. Please try again.");
     }
-  };
+    
+    await markBackupAsRestored(latestBackupId);
+    
+    backupData.restored = true;
+    await AsyncStorage.setItem(
+      `@oldTxBackup_${customer.id}_${latestBackupId}`,
+      JSON.stringify(backupData)
+    );
+    
+    await fetchTransactions();
+    await fetchCustomerBalance();
+    
+    const successMessage = isOldTransactionsBackup
+      ? `${oldTx.length} old transaction(s) restored!\n\nYour current balance remains: ${currency}${formatCurrency(currentBalance)}\n\nThese already-paid transactions are now visible in the Old Transactions tab.`
+      : `${oldTx.length} transaction(s) restored!\n\nOld Balance: ${currency}${formatCurrency(currentBalance)}\nRestored Amount: ${currency}${formatCurrency(backupData.totalAmount)}\nNew Balance: ${currency}${formatCurrency(currentBalance + backupData.totalAmount)}`;
+    
+    Alert.alert("Restore Complete", successMessage);
+    
+    setIsRestored(true);
+  } catch (error) {
+    console.error("Error during restore:", error);
+    Alert.alert("Error", "Failed to restore transactions. Please try again.");
+  }
+};
 
   // Delete with backup using unique IDs
   const handleDeleteWithBackup = () => {
@@ -735,12 +771,128 @@ const dropdownData = allSegments.map((segment, index) => ({
   };
 
   // Delete permanently (no backup, cannot be restored)
-  const handleDeletePermanently = () => {
-    const tabName = activeTab === "new" ? "NEW" : "OLD";
+// Replace your handleDeletePermanently function with this corrected version:
+
+const handleDeletePermanently = () => {
+  const tabName = activeTab === "new" ? "NEW" : "OLD";
+  const buttonLabel = activeTab === "new" ? "Delete" : "Delete Permanently";
+  
+  Alert.alert(
+    `⚠️ ${buttonLabel} ${tabName} Transactions`,
+    `WARNING: This will PERMANENTLY delete all ${tabName.toLowerCase()} transactions. This action CANNOT be undone and NO backup will be created.`,
+    [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "I Understand, Delete Permanently",
+        style: "destructive",
+        onPress: () => {
+          Alert.alert(
+            "⚠️ Final Confirmation",
+            "Are you absolutely sure? This cannot be undone.",
+            [
+              { text: "Cancel", style: "cancel" },
+              {
+                text: "Yes, Delete Forever",
+                style: "destructive",
+                onPress: async () => {
+                  let transactionIdsToDelete: string[] = [];
+                  
+                  if (activeTab === "new") {
+                    const { newTransactions } = getTransactionSegments(transactions);
+                    transactionIdsToDelete = newTransactions
+                      .map(tx => tx.transaction_id || "")
+                      .filter(id => id !== "");
+                    
+                    // *** FIX: ADD back the transaction amounts to balance ***
+                    // Because deleting payments means customer owes that money again
+                    const totalToAddBack = newTransactions.reduce(
+                      (sum, tx) => sum + tx.amount,
+                      0
+                    );
+                    
+                    if (totalToAddBack > 0) {
+                      const newBalance = currentBalance + totalToAddBack; // CHANGED from minus to plus
+                      
+                      const { error: balanceError } = await supabase
+                        .from("customers")
+                        .update({ balance: newBalance })
+                        .eq("id", customer.id);
+                      
+                      if (balanceError) {
+                        console.error("Error updating balance:", balanceError);
+                        Alert.alert("Error", "Failed to update balance");
+                        return;
+                      }
+                      
+                      setCurrentBalance(newBalance);
+                    }
+                  } else if (activeTab === "old") {
+                    const { oldTransactions } = getTransactionSegments(transactions);
+                    transactionIdsToDelete = oldTransactions
+                      .map(tx => tx.transaction_id || "")
+                      .filter(id => id !== "");
+                    
+                    // Remove any backups for old transactions
+                    await AsyncStorage.removeItem(`@oldTxBackup_${customer.id}`);
+                  }
+                  
+                  if (transactionIdsToDelete.length === 0) {
+                    Alert.alert("No transactions to delete");
+                    return;
+                  }
+                  
+                  // Delete from database
+                  await supabase
+                    .from("transactions")
+                    .delete()
+                    .in("transaction_id", transactionIdsToDelete);
+                    
+                  // Update local state
+                  setTransactions(prev => 
+                    prev.filter(tx => !transactionIdsToDelete.includes(tx.transaction_id || ""))
+                  );
+                  
+                  setSelectedTransactions([]);
+                  
+                  Alert.alert(
+                    "Permanently Deleted", 
+                    `${tabName} transactions have been permanently removed and cannot be restored.`
+                  );
+                },
+              },
+            ]
+          );
+        },
+      },
+    ]
+  );
+};
+
+
+ const handleDeleteSelected = () => {
+    if (!selectedTransactions.length) {
+      Alert.alert("No transactions selected");
+      return;
+    }
+    
+    // Only allow deleting from NEW tab
+    if (activeTab !== "new") {
+      Alert.alert(
+        "Cannot Delete",
+        "Please use 'Delete with Backup' or 'Delete Permanently' buttons for old transactions."
+      );
+      return;
+    }
+    
+    const txsToDelete = transactions.filter((tx) =>
+      selectedTransactions.includes(tx.transaction_id || "")
+    );
+    const totalAmount = txsToDelete.reduce((sum, tx) => sum + tx.amount, 0);
+    const newBalance = currentBalance + totalAmount;
     
     Alert.alert(
-      `⚠️ Delete ${tabName} Transactions Permanently`,
-      `WARNING: This will PERMANENTLY delete all ${tabName.toLowerCase()} transactions. This action CANNOT be undone and NO backup will be created.`,
+      `⚠️ Delete ${selectedTransactions.length} Selected Transaction${selectedTransactions.length > 1 ? 's' : ''}`,
+      `WARNING: This will PERMANENTLY delete the selected transaction${selectedTransactions.length > 1 ? 's' : ''}. This action CANNOT be undone and NO backup will be created.\n\nAmount to be added back: ${currency}${formatCurrency(totalAmount)}\nNew Balance: ${currency}${formatCurrency(newBalance)}`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -756,58 +908,37 @@ const dropdownData = allSegments.map((segment, index) => ({
                   text: "Yes, Delete Forever",
                   style: "destructive",
                   onPress: async () => {
-                    let transactionIdsToDelete: string[] = [];
-                    
-                    if (activeTab === "new") {
-                      const { newTransactions } = getTransactionSegments(transactions);
-                      transactionIdsToDelete = newTransactions
-                        .map(tx => tx.transaction_id || "")
-                        .filter(id => id !== "");
-                    } else if (activeTab === "old") {
-                      const { oldTransactions } = getTransactionSegments(transactions);
-                      transactionIdsToDelete = oldTransactions
-                        .map(tx => tx.transaction_id || "")
-                        .filter(id => id !== "");
-                      
-                      await AsyncStorage.removeItem(`@oldTxBackup_${customer.id}`);
-                    }
-                    
-                    if (transactionIdsToDelete.length === 0) {
-                      Alert.alert("No transactions to delete");
-                      return;
-                    }
-                    
-                    if (activeTab === "new") {
-                      const { newTransactions } = getTransactionSegments(transactions);
-                      const transactionsAffectingBalance = newTransactions;
-                      
-                      const totalToSubtract = transactionsAffectingBalance.reduce(
-                        (sum, tx) => sum + tx.amount,
-                        0
-                      );
-                      
-                      if (totalToSubtract > 0) {
-                        const updated = currentBalance - totalToSubtract;
-                        await supabase
-                          .from("customers")
-                          .update({ balance: updated })
-                          .eq("id", customer.id);
-                        setCurrentBalance(updated);
-                      }
-                    }
-                    
+                    // Delete from database
                     await supabase
                       .from("transactions")
                       .delete()
-                      .in("transaction_id", transactionIdsToDelete);
-                      
+                      .in("transaction_id", selectedTransactions);
+                    
+                    // Update balance - add back the amount since payments are being removed
+                    const { error: balanceError } = await supabase
+                      .from("customers")
+                      .update({ balance: newBalance })
+                      .eq("id", customer.id);
+                    
+                    if (balanceError) {
+                      console.error("Error updating balance:", balanceError);
+                      Alert.alert("Error", "Failed to update balance");
+                      return;
+                    }
+                    
+                    setCurrentBalance(newBalance);
+                    
+                    // Update local state
                     setTransactions(prev => 
-                      prev.filter(tx => !transactionIdsToDelete.includes(tx.transaction_id || ""))
+                      prev.filter(tx => !selectedTransactions.includes(tx.transaction_id || ""))
                     );
                     
                     setSelectedTransactions([]);
                     
-                    Alert.alert("Permanently Deleted", `${tabName} transactions have been permanently removed and cannot be restored.`);
+                    Alert.alert(
+                      "Permanently Deleted", 
+                      `${txsToDelete.length} transaction${txsToDelete.length > 1 ? 's have' : ' has'} been permanently removed.\n\nOld Balance: ${currency}${formatCurrency(currentBalance)}\nAmount Added Back: ${currency}${formatCurrency(totalAmount)}\nNew Balance: ${currency}${formatCurrency(newBalance)}`
+                    );
                   },
                 },
               ]
@@ -816,41 +947,6 @@ const dropdownData = allSegments.map((segment, index) => ({
         },
       ]
     );
-  };
-
-  const handleDeleteSelected = async () => {
-    if (!selectedTransactions.length) {
-      Alert.alert("No transactions selected");
-      return;
-    }
-    
-    await backupOldTransactions();
-    
-    const ok = await confirmAsync(
-      "Delete Selected",
-      `Delete ${selectedTransactions.length} transaction(s)?`
-    );
-    if (!ok) return;
-
-    const txsToDelete = transactions.filter((tx) =>
-      selectedTransactions.includes(tx.transaction_id || "")
-    );
-    const totalAmount = txsToDelete.reduce((sum, tx) => sum + tx.amount, 0);
-
-    await supabase
-      .from("transactions")
-      .delete()
-      .in("transaction_id", selectedTransactions);
-
-    const updated = currentBalance + totalAmount;
-    await supabase
-      .from("customers")
-      .update({ balance: updated })
-      .eq("id", customer.id);
-
-    setCurrentBalance(updated);
-    setSelectedTransactions([]);
-    fetchTransactions();
   };
 
   // --- OFFLINE QUEUE LOGIC ---
@@ -1141,85 +1237,86 @@ const renderTransactionItem = (tx: Transaction, type: 'new' | 'old') => (
   </Text>
  </View>
 
-      {activeTab === "new" && (
-        <>
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[
-                styles.button,
-                isConnected ? styles.addButton : styles.disabledButton,
-              ]}
-              onPress={() => setAddModalVisible(true)}
-              disabled={!isConnected}
-            >
-              <Text style={styles.buttonText}>
-                {isConnected ? "Add Transaction" : "Queue Transaction"}
-              </Text>
-            </TouchableOpacity>
+{activeTab === "new" && (
+  <>
+    <View style={styles.buttonRow}>
+      <TouchableOpacity
+        style={[
+          styles.button,
+          isConnected ? styles.addButton : styles.disabledButton,
+        ]}
+        onPress={() => setAddModalVisible(true)}
+        disabled={!isConnected}
+      >
+        <Text style={styles.buttonText}>
+          {isConnected ? "Add Transaction" : "Queue Transaction"}
+        </Text>
+      </TouchableOpacity>
 
-            {selectedTransactions.length > 0 && (
-              <TouchableOpacity
-                style={[styles.button, styles.deleteButton]}
-                onPress={handleDeleteSelected}
-              >
-                <Text style={styles.buttonText}>Delete Selected</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[styles.button, styles.deleteWithBackupButton]}
-              onPress={handleDeleteWithBackup}
-            >
-              <Text style={styles.buttonText}>Delete with Backup</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.button, styles.deletePermanentButton]}
-              onPress={handleDeletePermanently}
-            >
-              <Text style={styles.buttonText}>⚠️ Delete Permanently</Text>
-            </TouchableOpacity>
-          </View>
-        </>
-      )}
-
-      {activeTab === "old" && (
-        <>
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[styles.button, styles.deleteWithBackupButton]}
-              onPress={handleDeleteWithBackup}
-            >
-              <Text style={styles.buttonText}>Delete with Backup</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.button, styles.deletePermanentButton]}
-              onPress={handleDeletePermanently}
-            >
-              <Text style={styles.buttonText}>⚠️ Delete Permanently</Text>
-            </TouchableOpacity>
-          </View>
-        </>
-      )}
-
-      <View style={styles.backupRestoreContainer}>
+      {selectedTransactions.length > 0 && (
         <TouchableOpacity
-          style={[styles.button, styles.restoreButton]}
-          onPress={restoreOldTransactions}
+          style={[styles.button, styles.deleteButton]}
+          onPress={handleDeleteSelected}
         >
-          <Text style={styles.buttonText}>Restore Old Transactions</Text>
+          <Text style={styles.buttonText}>Delete Selected</Text>
         </TouchableOpacity>
-        
-        <TouchableOpacity
-          style={[styles.button, styles.viewOldButton]}
-          onPress={() => navigation.navigate('OldTransactions', { customer })}
-        >
-          <Text style={styles.buttonText}>View All Old Transactions</Text>
-        </TouchableOpacity>
-      </View>
+      )}
+    </View>
+
+    <View style={styles.buttonRow}>
+      <TouchableOpacity
+        style={[styles.button, styles.deletePermanentButton]}
+        onPress={handleDeletePermanently}
+      >
+        <Text style={styles.buttonText}>Delete</Text>  {/* CHANGED HERE */}
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={[styles.button, styles.viewOldButton]}
+        onPress={() => navigation.navigate('OldTransactions', { customer })}
+      >
+        <Text style={styles.buttonText}>View All Old Transactions</Text>
+      </TouchableOpacity>
+    </View>
+  </>
+)}
+
+
+{activeTab === "old" && (
+  <>
+    <View style={styles.buttonRow}>
+      <TouchableOpacity
+        style={[styles.button, styles.deleteWithBackupButton]}
+        onPress={handleDeleteWithBackup}
+      >
+        <Text style={styles.buttonText}>Delete with Backup</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={[styles.button, styles.deletePermanentButton]}
+        onPress={handleDeletePermanently}
+      >
+        <Text style={styles.buttonText}>⚠️ Delete Permanently</Text>
+      </TouchableOpacity>
+    </View>
+
+    <View style={styles.backupRestoreContainer}>
+      <TouchableOpacity
+        style={[styles.button, styles.restoreButton]}
+        onPress={restoreOldTransactions}
+      >
+        <Text style={styles.buttonText}>Restore Old Transactions</Text>
+      </TouchableOpacity>
+      
+      <TouchableOpacity
+        style={[styles.button, styles.viewOldButton]}
+        onPress={() => navigation.navigate('OldTransactions', { customer })}
+      >
+        <Text style={styles.buttonText}>View All Old Transactions</Text>
+      </TouchableOpacity>
+    </View>
+  </>
+)}
 
       
 
